@@ -1,0 +1,45 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Visual Studio
+.vs/
+*.csproj.user
+
+## Rider
+.idea/
+
+## Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+
+## NuGet
+*.nupkg
+**/[Pp]ackages/*
+!**/[Pp]ackages/build/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Lambda
+.aws-sam/
+
+## Environment and local config
+.env
+.env.*
+!.env.example
+appsettings.local.json
+appsettings.*.local.json
+**/appsettings.local.json
+
+## Secrets
+*.pem
+*.key
+credentials.json
