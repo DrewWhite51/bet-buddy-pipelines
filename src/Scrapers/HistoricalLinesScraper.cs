@@ -5,6 +5,7 @@ using AngleSharp.Html.Dom;
 using AngleSharp.Html.Parser;
 using Serilog;
 using SportsBettingPipeline.Core.Models;
+using SportsBettingPipeline.Core.Models.HistoricalGame;
 using SportsBettingPipeline.Core.Scrapers;
 
 
