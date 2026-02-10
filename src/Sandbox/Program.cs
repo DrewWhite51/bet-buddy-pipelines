@@ -8,24 +8,30 @@ using SportsBettingPipeline.Scrapers;
 // --- Parse Command Line Arguments ---
 var dryRun = args.Contains("--dry-run") || args.Contains("-d");
 var showHelp = args.Contains("--help") || args.Contains("-h");
+var runPff = args.Contains("--pff");
 
 if (showHelp)
 {
     Console.WriteLine(@"
-Sports Betting Pipeline - Historical Odds Scraper
+Sports Betting Pipeline - Scraper CLI
 
 Usage: dotnet run --project Sandbox [options]
+
+Scraper Selection:
+  --pff               Run PFF week-by-week HTML scraper (default: historical lines)
 
 Options:
   --dry-run, -d       Scrape and parse data but don't upload to S3 (preview only)
   --year, -y <year>   Scrape a single year (e.g., --year 2024)
-  --from <year>       Start year for range (default: 1952)
+  --from <year>       Start year for range (default: 1952 for lines, 2000 for PFF)
   --to <year>         End year for range (default: 2025)
   --help, -h          Show this help message
 
 Examples:
   dotnet run --project Sandbox --dry-run --year 2024
   dotnet run --project Sandbox --from 2020 --to 2025
+  dotnet run --project Sandbox --pff --year 2024
+  dotnet run --project Sandbox --pff --from 2020 --to 2024 --dry-run
   dotnet run --project Sandbox -d -y 2023
   dotnet run --project Sandbox                         # Full range 1952-2025 to S3
 ");
@@ -98,8 +104,15 @@ httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
 
 var historicalScraper = new HistoricalLinesScraper(httpClient, Log.Logger);
+var pffScraper = new PFFScraper(httpClient, Log.Logger);
 
 // --- Determine years to scrape ---
+// Adjust default start year for PFF scraper
+if (runPff && fromYear == 1952)
+{
+    fromYear = 2000;
+}
+
 int[] yearsToScrape;
 if (singleYear.HasValue)
 {
@@ -112,72 +125,136 @@ else
     Log.Information("Scraping year range: {From} to {To} ({Count} seasons)", fromYear, toYear, yearsToScrape.Length);
 }
 
-// --- Historical Odds Scraping ---
-if (dryRun)
+// --- Execute Selected Scraper ---
+if (runPff)
 {
-    // Dry run: scrape and preview, don't upload
-    Log.Information("--- DRY RUN: Scraping Historical Odds (no S3 upload) ---");
+    // --- PFF Week-by-Week HTML Scraping ---
+    Log.Information("=== PFF Week-by-Week HTML Scraper ===");
 
-    foreach (var year in yearsToScrape)
+    if (dryRun)
     {
+        Log.Information("--- DRY RUN: PFF Scraping (no S3 upload) ---");
+
+        foreach (var year in yearsToScrape)
+        {
+            try
+            {
+                var weekResults = await pffScraper.ScrapeYearDryRunAsync(year);
+                Log.Information("  {Year}: {Count} weeks found", year, weekResults.Count);
+
+                foreach (var (week, length, key) in weekResults.Take(3))
+                {
+                    Log.Information("    Week {Week}: {Length} bytes -> {Key}", week, length, key);
+                }
+                if (weekResults.Count > 3)
+                    Log.Information("    ... and {More} more weeks", weekResults.Count - 3);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to dry-run year {Year}", year);
+            }
+        }
+    }
+    else if (!string.IsNullOrEmpty(settings.Aws.S3BucketName))
+    {
+        Log.Information("--- PFF Scraping to S3 ---");
+
         try
         {
-            var games = await historicalScraper.ParseHistoricalTablesAsync(year);
-            Log.Information("  {Year}: {Count} games parsed", year, games.Count);
+            var s3Client = new Amazon.S3.AmazonS3Client(
+                Amazon.RegionEndpoint.GetBySystemName(settings.Aws.Region));
 
-            // Show first 3 games as preview
-            foreach (var game in games.Take(3))
+            var results = await pffScraper.ScrapeMultipleYearsToS3Async(
+                s3Client, settings.Aws.S3BucketName, yearsToScrape);
+
+            Log.Information("--- PFF Upload Results ---");
+            foreach (var (year, weekResults) in results)
             {
-                Log.Information("    {Game}", game.ToString());
+                var successCount = weekResults.Count(kv => !kv.Value.StartsWith("ERROR"));
+                Log.Information("  {Year}: {Success}/{Total} weeks uploaded",
+                    year, successCount, weekResults.Count);
             }
-            if (games.Count > 3)
-                Log.Information("    ... and {More} more", games.Count - 3);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Failed to scrape year {Year}", year);
+            Log.Error(ex, "PFF S3 upload failed");
         }
     }
-}
-else if (!string.IsNullOrEmpty(settings.Aws.S3BucketName))
-{
-    // Upload to S3
-    Log.Information("--- Scraping Historical Odds to S3 ---");
-
-    try
+    else
     {
-        var s3Client = new Amazon.S3.AmazonS3Client(
-            Amazon.RegionEndpoint.GetBySystemName(settings.Aws.Region));
-
-        var results = await historicalScraper.ScrapeMultipleYearsToS3Async(
-            s3Client, settings.Aws.S3BucketName, yearsToScrape);
-
-        Log.Information("--- Upload Results ---");
-        foreach (var (year, key) in results)
-        {
-            Log.Information("  {Year}: {Key}", year, key);
-        }
-    }
-    catch (Exception ex)
-    {
-        Log.Error(ex, "Historical odds S3 upload failed");
+        Log.Warning("No S3 bucket configured. PFF scraper requires S3 for output.");
+        Log.Information("Set S3_BUCKET_NAME environment variable or configure in appsettings.json");
     }
 }
 else
 {
-    // No S3 configured - save to local files
-    Log.Information("--- Scraping Historical Odds to Local Files (no S3 bucket configured) ---");
-
-    foreach (var year in yearsToScrape)
+    // --- Historical Odds Scraping ---
+    if (dryRun)
     {
+        // Dry run: scrape and preview, don't upload
+        Log.Information("--- DRY RUN: Scraping Historical Odds (no S3 upload) ---");
+
+        foreach (var year in yearsToScrape)
+        {
+            try
+            {
+                var games = await historicalScraper.ParseHistoricalTablesAsync(year);
+                Log.Information("  {Year}: {Count} games parsed", year, games.Count);
+
+                // Show first 3 games as preview
+                foreach (var game in games.Take(3))
+                {
+                    Log.Information("    {Game}", game.ToString());
+                }
+                if (games.Count > 3)
+                    Log.Information("    ... and {More} more", games.Count - 3);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to scrape year {Year}", year);
+            }
+        }
+    }
+    else if (!string.IsNullOrEmpty(settings.Aws.S3BucketName))
+    {
+        // Upload to S3
+        Log.Information("--- Scraping Historical Odds to S3 ---");
+
         try
         {
-            var filePath = await historicalScraper.SaveCsvToFileAsync(year);
-            Log.Information("  {Year}: {Path}", year, filePath);
+            var s3Client = new Amazon.S3.AmazonS3Client(
+                Amazon.RegionEndpoint.GetBySystemName(settings.Aws.Region));
+
+            var results = await historicalScraper.ScrapeMultipleYearsToS3Async(
+                s3Client, settings.Aws.S3BucketName, yearsToScrape);
+
+            Log.Information("--- Upload Results ---");
+            foreach (var (year, key) in results)
+            {
+                Log.Information("  {Year}: {Key}", year, key);
+            }
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Failed to scrape year {Year}", year);
+            Log.Error(ex, "Historical odds S3 upload failed");
+        }
+    }
+    else
+    {
+        // No S3 configured - save to local files
+        Log.Information("--- Scraping Historical Odds to Local Files (no S3 bucket configured) ---");
+
+        foreach (var year in yearsToScrape)
+        {
+            try
+            {
+                var filePath = await historicalScraper.SaveCsvToFileAsync(year);
+                Log.Information("  {Year}: {Path}", year, filePath);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "Failed to scrape year {Year}", year);
+            }
         }
     }
 }
