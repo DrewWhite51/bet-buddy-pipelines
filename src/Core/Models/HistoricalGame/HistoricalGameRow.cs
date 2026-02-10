@@ -1,4 +1,4 @@
-namespace SportsBettingPipeline.Core.Models;
+namespace SportsBettingPipeline.Core.Models.HistoricalGame;
 
 /// <summary>
 /// Represents a single row from a historical odds table.
