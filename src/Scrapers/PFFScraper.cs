@@ -1,8 +1,10 @@
 using Amazon.S3;
 using Amazon.S3.Model;
 using AngleSharp.Html.Dom;
+using AngleSharp.Html.Parser;
 using Serilog;
 using SportsBettingPipeline.Core.Models;
+using SportsBettingPipeline.Core.Models.HistoricalGame;
 using SportsBettingPipeline.Core.Scrapers;
 
 namespace SportsBettingPipeline.Scrapers;
@@ -194,4 +196,264 @@ public class PFFScraper : BaseScraperService
 
         return results;
     }
+
+    #region Game Reference Extraction
+
+    /// <summary>
+    /// Generates S3 key for unprocessed week HTML (current location).
+    /// </summary>
+    private static string GenerateWeekUnprocessedKey(int year, int week)
+        => $"pff-historical-games/unprocessed/{year}/week{week}.html";
+
+    /// <summary>
+    /// Generates S3 key for processed week HTML.
+    /// </summary>
+    private static string GenerateWeekProcessedKey(int year, int week)
+        => $"pff-historical-games/weeks/processed/{year}/week{week}.html";
+
+    /// <summary>
+    /// Generates S3 key for game reference CSV.
+    /// </summary>
+    private static string GenerateGameReferenceCsvKey(int year, int week)
+        => $"pff-historical-games/game-references/{year}/week{week}.csv";
+
+    /// <summary>
+    /// Reads an object from S3. Returns null if not found.
+    /// </summary>
+    public async Task<string?> ReadS3ObjectAsync(IAmazonS3 s3Client, string bucketName, string key)
+    {
+        try
+        {
+            var response = await s3Client.GetObjectAsync(bucketName, key);
+            using var reader = new StreamReader(response.ResponseStream);
+            return await reader.ReadToEndAsync();
+        }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            Logger.Debug("S3 object not found: {Key}", key);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Moves an S3 object from source to destination (copy + delete).
+    /// </summary>
+    public async Task MoveS3ObjectAsync(IAmazonS3 s3Client, string bucketName, string sourceKey, string destKey)
+    {
+        await s3Client.CopyObjectAsync(bucketName, sourceKey, bucketName, destKey);
+        await s3Client.DeleteObjectAsync(bucketName, sourceKey);
+        Logger.Information("Moved s3://{Bucket}/{Source} -> {Dest}", bucketName, sourceKey, destKey);
+    }
+
+    /// <summary>
+    /// Parses week HTML to extract game references (boxscore URLs).
+    /// </summary>
+    public List<GameReference> ParseGameReferencesFromHtml(string html, int year, int week)
+    {
+        var parser = new HtmlParser();
+        var document = parser.ParseDocument(html);
+        var games = new List<GameReference>();
+        var seenGameIds = new HashSet<string>();
+
+        // Find all boxscore links: <a href="/boxscores/202409050kan.htm">
+        var links = document.QuerySelectorAll("a[href*='/boxscores/']");
+
+        foreach (var link in links)
+        {
+            var href = link.GetAttribute("href");
+            if (string.IsNullOrEmpty(href) || !href.EndsWith(".htm"))
+                continue;
+
+            try
+            {
+                var gameId = GameReference.ExtractGameIdFromUrl(href);
+
+                // Skip if we've already seen this game (duplicates in HTML)
+                if (string.IsNullOrEmpty(gameId) || gameId.Length < 12 || seenGameIds.Contains(gameId))
+                    continue;
+
+                seenGameIds.Add(gameId);
+                var gameRef = GameReference.FromBoxscoreUrl(href, year, week);
+                games.Add(gameRef);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warning("Failed to parse boxscore URL {Href}: {Error}", href, ex.Message);
+            }
+        }
+
+        Logger.Debug("Parsed {Count} game references from year {Year} week {Week}", games.Count, year, week);
+        return games;
+    }
+
+    /// <summary>
+    /// Extracts game references from a week's HTML and saves to CSV in S3.
+    /// </summary>
+    public async Task<WeekExtractionResult> ExtractWeekToS3Async(
+        IAmazonS3 s3Client,
+        string bucketName,
+        int year,
+        int week,
+        bool skipMove = false)
+    {
+        Logger.Information("Extracting game references for {Year} week {Week}", year, week);
+
+        // Read week HTML from S3
+        var weekKey = GenerateWeekUnprocessedKey(year, week);
+        var html = await ReadS3ObjectAsync(s3Client, bucketName, weekKey);
+
+        if (html == null)
+        {
+            var error = $"Week HTML not found at {weekKey}";
+            Logger.Warning(error);
+            return new WeekExtractionResult(year, week, 0, null, error);
+        }
+
+        // Parse game references
+        var games = ParseGameReferencesFromHtml(html, year, week);
+
+        if (games.Count == 0)
+        {
+            Logger.Warning("No games found in {Year} week {Week}", year, week);
+            return new WeekExtractionResult(year, week, 0, null, "No games found in HTML");
+        }
+
+        // Generate CSV content
+        var csvLines = new List<string> { GameReference.CsvHeader };
+        csvLines.AddRange(games.Select(g => g.ToCsvLine()));
+        var csvContent = string.Join("\n", csvLines);
+
+        // Upload CSV to S3
+        var csvKey = GenerateGameReferenceCsvKey(year, week);
+        var request = new PutObjectRequest
+        {
+            BucketName = bucketName,
+            Key = csvKey,
+            ContentBody = csvContent,
+            ContentType = "text/csv"
+        };
+
+        await s3Client.PutObjectAsync(request);
+        Logger.Information("Uploaded {Count} game references to s3://{Bucket}/{Key}",
+            games.Count, bucketName, csvKey);
+
+        // Move week HTML to processed
+        if (!skipMove)
+        {
+            var processedKey = GenerateWeekProcessedKey(year, week);
+            await MoveS3ObjectAsync(s3Client, bucketName, weekKey, processedKey);
+        }
+
+        return new WeekExtractionResult(year, week, games.Count, csvKey);
+    }
+
+    /// <summary>
+    /// Dry run: extracts game references without uploading to S3.
+    /// </summary>
+    public async Task<(int GameCount, List<GameReference> Games)> ExtractWeekDryRunAsync(
+        IAmazonS3 s3Client,
+        string bucketName,
+        int year,
+        int week)
+    {
+        Logger.Information("DRY RUN: Extracting game references for {Year} week {Week}", year, week);
+
+        var weekKey = GenerateWeekUnprocessedKey(year, week);
+        var html = await ReadS3ObjectAsync(s3Client, bucketName, weekKey);
+
+        if (html == null)
+        {
+            Logger.Warning("DRY RUN: Week HTML not found at {Key}", weekKey);
+            return (0, new List<GameReference>());
+        }
+
+        var games = ParseGameReferencesFromHtml(html, year, week);
+        Logger.Information("DRY RUN: Found {Count} games in {Year} week {Week}", games.Count, year, week);
+
+        return (games.Count, games);
+    }
+
+    /// <summary>
+    /// Extracts game references for all weeks in a year.
+    /// </summary>
+    public async Task<YearExtractionResult> ExtractYearToS3Async(
+        IAmazonS3 s3Client,
+        string bucketName,
+        int year,
+        bool skipMove = false)
+    {
+        Logger.Information("Extracting game references for year {Year}", year);
+
+        var weekResults = new List<WeekExtractionResult>();
+        var week = 1;
+
+        while (true)
+        {
+            var weekKey = GenerateWeekUnprocessedKey(year, week);
+            var exists = await ReadS3ObjectAsync(s3Client, bucketName, weekKey);
+
+            if (exists == null)
+            {
+                Logger.Information("No more weeks found for year {Year} after week {Week}", year, week - 1);
+                break;
+            }
+
+            try
+            {
+                var result = await ExtractWeekToS3Async(s3Client, bucketName, year, week, skipMove);
+                weekResults.Add(result);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error(ex, "Failed to extract year {Year} week {Week}", year, week);
+                weekResults.Add(new WeekExtractionResult(year, week, 0, null, ex.Message));
+            }
+
+            week++;
+        }
+
+        var yearResult = new YearExtractionResult(year, weekResults);
+        Logger.Information("Completed year {Year}: {TotalGames} games from {SuccessWeeks} weeks",
+            year, yearResult.TotalGames, yearResult.SuccessfulWeeks);
+
+        return yearResult;
+    }
+
+    /// <summary>
+    /// Dry run: extracts game references for all weeks in a year without uploading.
+    /// </summary>
+    public async Task<List<(int Week, int GameCount)>> ExtractYearDryRunAsync(
+        IAmazonS3 s3Client,
+        string bucketName,
+        int year)
+    {
+        Logger.Information("DRY RUN: Extracting game references for year {Year}", year);
+
+        var results = new List<(int Week, int GameCount)>();
+        var week = 1;
+
+        while (true)
+        {
+            var weekKey = GenerateWeekUnprocessedKey(year, week);
+            var exists = await ReadS3ObjectAsync(s3Client, bucketName, weekKey);
+
+            if (exists == null)
+            {
+                Logger.Information("DRY RUN: No more weeks found for year {Year} after week {Week}", year, week - 1);
+                break;
+            }
+
+            var (gameCount, _) = await ExtractWeekDryRunAsync(s3Client, bucketName, year, week);
+            results.Add((week, gameCount));
+            week++;
+        }
+
+        var totalGames = results.Sum(r => r.GameCount);
+        Logger.Information("DRY RUN: Year {Year} total: {TotalGames} games from {WeekCount} weeks",
+            year, totalGames, results.Count);
+
+        return results;
+    }
+
+    #endregion
 }
